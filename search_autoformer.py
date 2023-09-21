@@ -1,5 +1,7 @@
 import random
 import pickle
+import sys
+import math
 import numpy as np
 import time
 import torch
@@ -83,6 +85,34 @@ class Searcher(object):
         self.choices = choices
         self.all_res = []
 
+    def save_cand_arch(self,cand,i):
+        file_path = os.path.join(args.output_dir, 'data_{}.yaml'.format(i))
+        new_dict = {}
+        new_dict['SUPERNET'] = {'MLP_RATIO': 4}
+        new_dict['SUPERNET']['NUM_HEADS'] = 4
+        new_dict['SUPERNET']['EMBED_DIM'] = 256
+        new_dict['SUPERNET']['DEPTH'] = 14
+        new_dict['SEARCH_SPACE'] = {'MLP_RATIO': [3.5, 4]}
+        new_dict['SEARCH_SPACE']['NUM_HEADS'] = [3,4]
+        new_dict['SEARCH_SPACE']['DEPTH'] = [12,13,14]
+        new_dict['SEARCH_SPACE']['EMBED_DIM'] = [192, 216, 240]
+
+
+        # Iterate over the key-value pairs in the original dictionary
+        for key, value in cand.items():
+            # You can apply transformations or filters here if needed
+            # In this example, we are creating a new dictionary with the same key-value pairs
+            if(key == 'mlp_ratio'):
+                new_dict['RETRAIN'] = {'MLP_RATIO': value}
+            if(key == 'num_heads'):
+                new_dict['RETRAIN']['NUM_HEADS'] = value
+            if (key == 'layer_num'):
+                new_dict['RETRAIN']['DEPTH'] = value
+            if (key == 'embed_dim'):
+                new_dict['RETRAIN']['EMBED_DIM'] = value[0]
+
+        with open(file_path, 'w') as yaml_file:
+            yaml.dump(new_dict, yaml_file)
     def save_checkpoint(self):
 
         info = {}
@@ -126,6 +156,11 @@ class Searcher(object):
             return False
 
         print("rank:", utils.get_rank(), cand, info['params'])
+
+
+        # Write the dictionary to a YAML file
+        #self.save_cand_arch(cand)
+
         set_arc(self.val_loader, self.model_without_ddp, self.device, amp=self.args.amp, mode='retrain',
                               retrain_config=sampled_config)
 
@@ -182,6 +217,17 @@ class Searcher(object):
 
     def search(self):
         self.get_random(self.population_num)
+
+        dss = []
+        for i in range(len(self.candidates)):
+            dss.append(self.all_res[i]['indicator']['dss'])
+        zipped_data = list(zip(self.candidates, dss))
+        sorted_data = sorted(zipped_data, key=lambda x: x[1], reverse=True)
+        sorted_items = [item[0] for item in sorted_data]
+        top50 = math.ceil((self.population_num*50)/100)
+        for i in range(top50):
+            self.save_cand_arch(sorted_items[i],i)
+
         print('Searched Architecture: ', self.top['cand'])
 
 
@@ -374,7 +420,7 @@ def main(args):
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, args.nb_classes = build_dataset(is_train=False, args=args, folder_name="subImageNet")
     dataset_test, _ = build_dataset(is_train=False, args=args, folder_name="val")
-
+    args.distributed = False
     if args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()

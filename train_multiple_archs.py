@@ -25,8 +25,18 @@ import timm
 from model.pit_space import pit
 from model.autoformer_space import Vision_TransformerSuper
 from collections import OrderedDict
+import glob
 
+def find_yaml_files(folder_path):
+    yaml_files = []
+    for filename in glob.glob(os.path.join(folder_path, '*data*.yaml')):
+        yaml_files.append(filename)
+    return yaml_files
 
+def parse_yaml_file(file_path):
+    with open(file_path, 'r') as file:
+        yaml_data = yaml.load(file, Loader=yaml.FullLoader)
+    return yaml_data
 def get_args_parser():
     parser = argparse.ArgumentParser('Training and Evaluation Script', add_help=False)
     parser.add_argument('--batch-size', default=256, type=int)
@@ -186,6 +196,8 @@ def get_args_parser():
 
     parser.add_argument('--amp', action='store_true')
     parser.add_argument('--no-amp', action='store_false', dest='amp')
+    parser.add_argument('--archs_dir', default='',
+                        help='path where architecture configurations are saved')
     parser.set_defaults(amp=True)
 
 
@@ -196,7 +208,14 @@ def main(args):
     utils.init_distributed_mode(args)
     update_config_from_file(args.cfg)
     args.distributed = False
-    print(args)
+    #print(args)
+    print(args.archs_dir)
+    folder_path = args.archs_dir
+    yaml_files = find_yaml_files(folder_path)
+    cfgs = []
+    if yaml_files:
+        for yaml_file in yaml_files:
+            cfgs.append(parse_yaml_file(yaml_file))
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
 
     device = torch.device(args.device)
@@ -234,6 +253,7 @@ def main(args):
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
+    args.batch_size = 64
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
@@ -241,7 +261,7 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
-    args.batch_size = 128
+
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, batch_size=int(2 * args.batch_size),
         sampler=sampler_val, num_workers=args.num_workers,
@@ -256,159 +276,180 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
-    print(cfg)
-    if args.model_type == 'AUTOFORMER':
-        model_type = args.model_type
-        model = Vision_TransformerSuper(img_size=args.input_size,
-                                        patch_size=args.patch_size,
-                                        embed_dim=cfg.SUPERNET.EMBED_DIM, depth=cfg.SUPERNET.DEPTH,
-                                        num_heads=cfg.SUPERNET.NUM_HEADS,mlp_ratio=cfg.SUPERNET.MLP_RATIO,
-                                        qkv_bias=True, drop_rate=args.drop,
-                                        drop_path_rate=args.drop_path,
-                                        gp=args.gp,
-                                        num_classes=args.nb_classes,
-                                        max_relative_position=args.max_relative_position,
-                                        relative_position=args.relative_position,
-                                        change_qkv=args.change_qkv, abs_pos=not args.no_abs_pos)
-        choices = {'num_heads': cfg.SEARCH_SPACE.NUM_HEADS, 'mlp_ratio': cfg.SEARCH_SPACE.MLP_RATIO,
-                   'embed_dim': cfg.SEARCH_SPACE.EMBED_DIM, 'depth': cfg.SEARCH_SPACE.DEPTH}
-    elif args.model_type == 'PIT':
-        model_type = args.model_type
-        retrain_config = None
-        retrain_config = {'layer_num': cfg.RETRAIN.DEPTH, 'base_dim': cfg.RETRAIN.BASE_DIM,
-                          'num_heads': cfg.RETRAIN.NUM_HEADS, 'mlp_ratio': cfg.RETRAIN.MLP_RATIO, 'patch_size': cfg.RETRAIN.PATCH_SIZE}
-        model = pit(retrain_config, pretrain = False)
-        choices = {'num_heads': cfg.SEARCH_SPACE.NUM_HEADS, 'mlp_ratio': cfg.SEARCH_SPACE.MLP_RATIO,
-                   'base_dim': cfg.SEARCH_SPACE.BASE_DIM, 'depth': cfg.SEARCH_SPACE.DEPTH,
-                   'patch_size': cfg.SEARCH_SPACE.PATCH_SIZE}
+    accuracies = []
+    while len(cfgs) > 0:
+        print('babis')
+        print(accuracies)
 
-    model.to(device)
-    if args.teacher_model:
-        teacher_model = create_model(
-            args.teacher_model,
-            pretrained=True,
-            num_classes=args.nb_classes,
-        )
-        teacher_model.to(device)
-        teacher_loss = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        teacher_model = None
-        teacher_loss = None
+        if len(accuracies) > 0:
+            sorted_accs = sorted(zip(accuracies, cfgs), reverse=True)
+            midpoint = len(accuracies) // 2
+            del sorted_accs[midpoint:]
+            cfgs = [item for _, item in sorted_accs]
+            accuracies = []
+        for i,cfg in enumerate(cfgs):
+            #print(cfg)
+            if args.model_type == 'AUTOFORMER':
+                model_type = args.model_type
+                model = Vision_TransformerSuper(img_size=args.input_size,
+                                                patch_size=args.patch_size,
+                                                embed_dim=cfg['SUPERNET']['EMBED_DIM'], depth=cfg['SUPERNET']['DEPTH'],
+                                                num_heads=cfg['SUPERNET']['NUM_HEADS'],mlp_ratio=cfg['SUPERNET']['MLP_RATIO'],
+                                                qkv_bias=True, drop_rate=args.drop,
+                                                drop_path_rate=args.drop_path,
+                                                gp=args.gp,
+                                                num_classes=args.nb_classes,
+                                                max_relative_position=args.max_relative_position,
+                                                relative_position=args.relative_position,
+                                                change_qkv=args.change_qkv, abs_pos=not args.no_abs_pos)
+                weights_path = os.path.join(args.archs_dir, 'model_{}_weights.pth'.format(i))
+                if os.path.exists(weights_path):
+                    model.load_state_dict(torch.load(weights_path))
 
-    model_ema = None
+                choices = {'num_heads': cfg['SEARCH_SPACE']['NUM_HEADS'], 'mlp_ratio': cfg['SEARCH_SPACE']['MLP_RATIO'],
+                           'embed_dim': cfg['SEARCH_SPACE']['EMBED_DIM'], 'depth': cfg['SEARCH_SPACE']['DEPTH']}
+            elif args.model_type == 'PIT':
+                model_type = args.model_type
+                retrain_config = None
+                retrain_config = {'layer_num': cfg.RETRAIN.DEPTH, 'base_dim': cfg.RETRAIN.BASE_DIM,
+                                  'num_heads': cfg.RETRAIN.NUM_HEADS, 'mlp_ratio': cfg.RETRAIN.MLP_RATIO, 'patch_size': cfg.RETRAIN.PATCH_SIZE}
+                model = pit(retrain_config, pretrain = False)
+                choices = {'num_heads': cfg.SEARCH_SPACE.NUM_HEADS, 'mlp_ratio': cfg.SEARCH_SPACE.MLP_RATIO,
+                           'base_dim': cfg.SEARCH_SPACE.BASE_DIM, 'depth': cfg.SEARCH_SPACE.DEPTH,
+                           'patch_size': cfg.SEARCH_SPACE.PATCH_SIZE}
 
-    model_without_ddp = model
-    if args.distributed:
+            model.to(device)
+            if args.teacher_model:
+                teacher_model = create_model(
+                    args.teacher_model,
+                    pretrained=True,
+                    num_classes=args.nb_classes,
+                )
+                teacher_model.to(device)
+                teacher_loss = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+            else:
+                teacher_model = None
+                teacher_loss = None
 
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
+            model_ema = None
 
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
+            model_without_ddp = model
+            if args.distributed:
 
-    linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
-    args.lr = linear_scaled_lr
-    optimizer = create_optimizer(args, model_without_ddp)
-    loss_scaler = NativeScaler()
-    lr_scheduler, _ = create_scheduler(args, optimizer)
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+                model_without_ddp = model.module
 
-    if args.mixup > 0.:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
+            n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print('number of params:', n_parameters)
 
-    output_dir = Path(args.output_dir)
+            linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
+            args.lr = linear_scaled_lr
+            optimizer = create_optimizer(args, model_without_ddp)
+            loss_scaler = NativeScaler()
+            lr_scheduler, _ = create_scheduler(args, optimizer)
 
-    if not output_dir.exists():
-        output_dir.mkdir(parents=True)
-    # save config for later experiments
-    with open(output_dir / "config.yaml", 'w') as f:
-        f.write(args_text)
-    def copyStateDict(state_dict):
-        if list(state_dict.keys())[0].startswith('module'):
-            start_idx = 1
-        else:
-            start_idx = 0
-        new_state_dict = OrderedDict()
-        for k,v in state_dict.items():
-            name = ','.join(k.split('.')[start_idx:])
-            new_state_dict[name] = v
-        return new_state_dict
-    if args.resume:
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
-            if 'scaler' in checkpoint:
-                loss_scaler.load_state_dict(checkpoint['scaler'])
-            if args.model_ema:
-                utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
-    if args.mode == 'retrain' and "RETRAIN" in cfg and model_type == 'AUTOFORMER':
-        retrain_config = None
-        retrain_config = {'layer_num': cfg.RETRAIN.DEPTH, 'embed_dim': [cfg.RETRAIN.EMBED_DIM]*cfg.RETRAIN.DEPTH,
-                          'num_heads': cfg.RETRAIN.NUM_HEADS,'mlp_ratio': cfg.RETRAIN.MLP_RATIO}
-    if args.eval:
-        test_stats = evaluate(data_loader_val, model_type, model, device,  mode = args.mode, retrain_config=retrain_config)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        return
+            if args.mixup > 0.:
+                # smoothing is handled with mixup label transform
+                criterion = SoftTargetCrossEntropy()
+            elif args.smoothing:
+                criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+            else:
+                criterion = torch.nn.CrossEntropyLoss()
 
-    print("Start training")
-    start_time = time.time()
-    max_accuracy = 0.0
+            output_dir = Path(args.output_dir)
 
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
+            if not output_dir.exists():
+                output_dir.mkdir(parents=True)
+            # save config for later experiments
+            with open(output_dir / "config.yaml", 'w') as f:
+                f.write(args_text)
+            def copyStateDict(state_dict):
+                if list(state_dict.keys())[0].startswith('module'):
+                    start_idx = 1
+                else:
+                    start_idx = 0
+                new_state_dict = OrderedDict()
+                for k,v in state_dict.items():
+                    name = ','.join(k.split('.')[start_idx:])
+                    new_state_dict[name] = v
+                return new_state_dict
+            if args.resume:
+                if args.resume.startswith('https'):
+                    checkpoint = torch.hub.load_state_dict_from_url(
+                        args.resume, map_location='cpu', check_hash=True)
+                else:
+                    checkpoint = torch.load(args.resume, map_location='cpu')
+                model_without_ddp.load_state_dict(checkpoint['model'])
+                if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                    args.start_epoch = checkpoint['epoch'] + 1
+                    if 'scaler' in checkpoint:
+                        loss_scaler.load_state_dict(checkpoint['scaler'])
+                    if args.model_ema:
+                        utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
+            if args.mode == 'retrain' and "RETRAIN" in cfg and model_type == 'AUTOFORMER':
+                retrain_config = None
+                retrain_config = {'layer_num': cfg['RETRAIN']['DEPTH'], 'embed_dim': [cfg['RETRAIN']['EMBED_DIM']]*cfg['RETRAIN']['DEPTH'],
+                                  'num_heads': cfg['RETRAIN']['NUM_HEADS'],'mlp_ratio': cfg['RETRAIN']['MLP_RATIO']}
+            if args.eval:
+                test_stats = evaluate(data_loader_val, model_type, model, device,  mode = args.mode, retrain_config=retrain_config)
+                print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                return
 
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train,
-            optimizer, device, epoch, model_type, loss_scaler,
-            args.clip_grad, model_ema, mixup_fn,
-            amp=args.amp, teacher_model=teacher_model,
-            teach_loss=teacher_loss,
-            choices=choices, mode = args.mode, retrain_config=retrain_config,
-        )
+            print("Start training")
+            start_time = time.time()
+            max_accuracy = 0.0
+            if(len(cfgs)) == 1:
+                epochs = 50
+            else:
+                epochs = args.epochs
+            for epoch in range(args.start_epoch, epochs):
+                if args.distributed:
+                    data_loader_train.sampler.set_epoch(epoch)
 
-        lr_scheduler.step(epoch)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    # 'model_ema': get_state_dict(model_ema),
-                    'scaler': loss_scaler.state_dict(),
-                    'args': args,
-                }, checkpoint_path)
+                train_stats = train_one_epoch(
+                    model, criterion, data_loader_train,
+                    optimizer, device, epoch, model_type, loss_scaler,
+                    args.clip_grad, model_ema, mixup_fn,
+                    amp=args.amp, teacher_model=teacher_model,
+                    teach_loss=teacher_loss,
+                    choices=choices, mode = args.mode, retrain_config=retrain_config,
+                )
+                weights_path = os.path.join(args.archs_dir, 'model_{}_weights.pth'.format(i))
+                torch.save(model.state_dict(), weights_path)
 
-        test_stats = evaluate(data_loader_val, model_type, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        max_accuracy = max(max_accuracy, test_stats["acc1"])
-        print(f'Max accuracy: {max_accuracy:.2f}%')
+                lr_scheduler.step(epoch)
+                if args.output_dir:
+                    checkpoint_paths = [output_dir / 'checkpoint.pth']
+                    for checkpoint_path in checkpoint_paths:
+                        utils.save_on_master({
+                            'model': model_without_ddp.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            # 'model_ema': get_state_dict(model_ema),
+                            'scaler': loss_scaler.state_dict(),
+                            'args': args,
+                        }, checkpoint_path)
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+                test_stats = evaluate(data_loader_val, model_type, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config)
+                print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                max_accuracy = max(max_accuracy, test_stats["acc1"])
+                print(f'Max accuracy: {max_accuracy:.2f}%')
 
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                             **{f'test_{k}': v for k, v in test_stats.items()},
+                             'epoch': epoch,
+                             'n_parameters': n_parameters}
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+                if args.output_dir and utils.is_main_process():
+                    with (output_dir / "log.txt").open("a") as f:
+                        f.write(json.dumps(log_stats) + "\n")
+            accuracies.append(max_accuracy)
+            total_time = time.time() - start_time
+            total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+            print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':
