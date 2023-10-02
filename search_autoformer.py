@@ -22,6 +22,7 @@ from lib.training_free import *
 from timm.utils.model import unwrap_model
 import copy
 from timm.utils import accuracy
+import matplotlib.pyplot as plt
 
 
 def decode_cand_tuple(cand_tuple):
@@ -221,11 +222,22 @@ class Searcher(object):
         dss = []
         for i in range(len(self.candidates)):
             dss.append(self.all_res[i]['indicator']['dss'])
+
+        plot = True
+        if(plot):
+            plt.hist(dss, bins=10, color='blue', edgecolor='black')
+            # Customize the plot (optional)
+            plt.title('architectures DSS distribution')
+            plt.xlabel('DSS')
+            plt.ylabel('Frequency')
+            # Show the plot
+            plt.show()
+
         zipped_data = list(zip(self.candidates, dss))
         sorted_data = sorted(zipped_data, key=lambda x: x[1], reverse=True)
         sorted_items = [item[0] for item in sorted_data]
-        top50 = math.ceil((self.population_num*50)/100)
-        for i in range(top50):
+        top10 = math.ceil((self.population_num*10)/100)
+        for i in range(top10):
             self.save_cand_arch(sorted_items[i],i)
 
         print('Searched Architecture: ', self.top['cand'])

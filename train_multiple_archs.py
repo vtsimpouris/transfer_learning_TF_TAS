@@ -26,6 +26,7 @@ from model.pit_space import pit
 from model.autoformer_space import Vision_TransformerSuper
 from collections import OrderedDict
 import glob
+import scipy.special
 
 def find_yaml_files(folder_path):
     yaml_files = []
@@ -37,6 +38,111 @@ def parse_yaml_file(file_path):
     with open(file_path, 'r') as file:
         yaml_data = yaml.load(file, Loader=yaml.FullLoader)
     return yaml_data
+
+def load_configs(file_path, max_cfgs):
+    folder_path = file_path
+    yaml_files = find_yaml_files(folder_path)
+    cfgs = []
+    i = 0
+    if yaml_files:
+        for yaml_file in yaml_files:
+            cfgs.append(parse_yaml_file(yaml_file))
+            i = i + 1
+            if(len(cfgs) + 1 > max_cfgs):
+                return cfgs
+    return cfgs
+
+class SuccessiveHalving:
+    def __init__(self, configs, models, resource_budget,data_loader_train,model_type,mixup_fn,choices,data_loader_val,dataset_val, min_resources = 1):
+        """
+        Initialize the Successive Halving algorithm.
+
+        Args:
+        - configs (list): List of configurations to be evaluated.
+        - models (list): List of models to be evaluated.
+        - resource_budget (int): Total budget of resources to allocate.
+        """
+        self.configs = configs
+        self.models = models
+        self.resource_budget = resource_budget
+        self.min_resources = min_resources
+        self.data_loader_train = data_loader_train
+        self.model_type = model_type
+        self.mixup_fn = mixup_fn
+        self.choices = choices
+        self.data_loader_val = self.data_loader_val
+        self.dataset_val = dataset_val
+
+
+    def max_models(self,B,e):
+        # Calculate C using the Lambert W function
+        C = 2 ** (scipy.special.lambertw(B) / e)
+        return int(np.real(C))
+    def run(self):
+        """
+        Run the Successive Halving algorithm.
+
+        Returns:
+        - list: List of selected configurations after running the algorithm.
+        """
+        device = torch.device(args.device)
+        n = self.max_models(self.resource_budget, self.min_resources)
+        if n > len(self.models):
+            n = len(self.models)
+        print(n)
+        self.models = self.models[0:n]
+        self.configs = self.configs[0:n]
+        b = self.min_resources
+        for i , model in enumerate(self.models):
+            cfg = self.configs[i]
+            for i in range(b):
+                model.to(device)
+                model_ema = None
+                model_without_ddp = model
+                n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print('number of params:', n_parameters)
+
+                linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
+                args.lr = linear_scaled_lr
+                optimizer = create_optimizer(args, model_without_ddp)
+                loss_scaler = NativeScaler()
+                lr_scheduler, _ = create_scheduler(args, optimizer)
+
+                if args.mixup > 0.:
+                    # smoothing is handled with mixup label transform
+                    criterion = SoftTargetCrossEntropy()
+                elif args.smoothing:
+                    criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+                else:
+                    criterion = torch.nn.CrossEntropyLoss()
+                if args.mode == 'retrain' and "RETRAIN" in cfg:
+                    retrain_config = None
+                    retrain_config = {'layer_num': cfg['RETRAIN']['DEPTH'],
+                                      'embed_dim': [cfg['RETRAIN']['EMBED_DIM']] * cfg['RETRAIN']['DEPTH'],
+                                      'num_heads': cfg['RETRAIN']['NUM_HEADS'],
+                                      'mlp_ratio': cfg['RETRAIN']['MLP_RATIO']}
+                print("Start training")
+                start_time = time.time()
+                max_accuracy = 0.0
+                train_stats = train_one_epoch(
+                    model, criterion, self.data_loader_train,
+                    optimizer, device, i, self.model_type, loss_scaler,
+                    args.clip_grad, model_ema, self.mixup_fn,
+                    amp=args.amp, teacher_model=None,
+                    teach_loss=None,
+                    choices=self.choices, mode = args.mode, retrain_config=retrain_config,
+                )
+                test_stats = evaluate(self.data_loader_val, self.model_type, model, device, amp=args.amp, choices=self.choices, mode = args.mode, retrain_config=retrain_config)
+                print(f"Accuracy of the network on the {len(self.dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                max_accuracy = max(max_accuracy, test_stats["acc1"])
+                print(f'Max accuracy: {max_accuracy:.2f}%')
+
+                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                             **{f'test_{k}': v for k, v in test_stats.items()},
+                             'epoch': i,
+                             'n_parameters': n_parameters}
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Training and Evaluation Script', add_help=False)
     parser.add_argument('--batch-size', default=256, type=int)
@@ -208,15 +314,8 @@ def main(args):
     utils.init_distributed_mode(args)
     update_config_from_file(args.cfg)
     args.distributed = False
-    #print(args)
-    print(args.archs_dir)
-    folder_path = args.archs_dir
-    yaml_files = find_yaml_files(folder_path)
-    cfgs = []
-    if yaml_files:
-        for yaml_file in yaml_files:
-            cfgs.append(parse_yaml_file(yaml_file))
-    args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
+
+
 
     device = torch.device(args.device)
 
@@ -276,10 +375,35 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
-    accuracies = []
+
+    max_cfgs = 40
+    cfgs = load_configs(args.archs_dir, max_cfgs)
+    args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
+    models = []
+    for i, cfg in enumerate(cfgs):
+        # print(cfg)
+        if args.model_type == 'AUTOFORMER':
+            model_type = args.model_type
+            model = Vision_TransformerSuper(img_size=args.input_size,
+                                            patch_size=args.patch_size,
+                                            embed_dim=cfg['SUPERNET']['EMBED_DIM'], depth=cfg['SUPERNET']['DEPTH'],
+                                            num_heads=cfg['SUPERNET']['NUM_HEADS'],
+                                            mlp_ratio=cfg['SUPERNET']['MLP_RATIO'],
+                                            qkv_bias=True, drop_rate=args.drop,
+                                            drop_path_rate=args.drop_path,
+                                            gp=args.gp,
+                                            num_classes=args.nb_classes,
+                                            max_relative_position=args.max_relative_position,
+                                            relative_position=args.relative_position,
+                                            change_qkv=args.change_qkv, abs_pos=not args.no_abs_pos)
+            models.append(model)
+
+            choices = {'num_heads': cfg['SEARCH_SPACE']['NUM_HEADS'], 'mlp_ratio': cfg['SEARCH_SPACE']['MLP_RATIO'],
+                       'embed_dim': cfg['SEARCH_SPACE']['EMBED_DIM'], 'depth': cfg['SEARCH_SPACE']['DEPTH']}
+    sh = SuccessiveHalving(cfgs, models, resource_budget=10, data_loader_train=data_loader_train, model_type=model_type, mixup_fn=mixup_fn, choices=choices, data_loader_val=data_loader_val, dataset_val=dataset_val)
+    sh.run()
+    '''accuracies = []
     while len(cfgs) > 0:
-        print('babis')
-        print(accuracies)
 
         if len(accuracies) > 0:
             sorted_accs = sorted(zip(accuracies, cfgs), reverse=True)
@@ -449,7 +573,7 @@ def main(args):
             accuracies.append(max_accuracy)
             total_time = time.time() - start_time
             total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-            print('Training time {}'.format(total_time_str))
+            print('Training time {}'.format(total_time_str))'''
 
 
 if __name__ == '__main__':
