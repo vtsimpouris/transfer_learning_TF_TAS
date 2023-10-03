@@ -1,3 +1,4 @@
+import math
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"]  =  "TRUE"
 import sys
@@ -26,7 +27,8 @@ from model.pit_space import pit
 from model.autoformer_space import Vision_TransformerSuper
 from collections import OrderedDict
 import glob
-import scipy.special
+import scipy.optimize as opt
+import random
 
 def find_yaml_files(folder_path):
     yaml_files = []
@@ -70,14 +72,30 @@ class SuccessiveHalving:
         self.model_type = model_type
         self.mixup_fn = mixup_fn
         self.choices = choices
-        self.data_loader_val = self.data_loader_val
+        self.data_loader_val = data_loader_val
         self.dataset_val = dataset_val
+        self.ids = list(range(0,len(self.models)))
 
 
     def max_models(self,B,e):
-        # Calculate C using the Lambert W function
-        C = 2 ** (scipy.special.lambertw(B) / e)
-        return int(np.real(C))
+        # Define the equation as a function
+        def equation(x, y, e):
+            return y - ((np.log2(x) - 1) * x * e)
+
+        # Use fsolve to find the root (x)
+        x_initial_guess = 1.0  # Provide an initial guess for x
+        x_solution = opt.fsolve(equation, x_initial_guess, args=(B,e))
+
+        return math.floor(x_solution[0])
+
+    def select_top_k_configs(self,accuracies):
+        combined_lists = list(zip(accuracies, self.models, self.configs, self.ids))
+        sorted_accs = sorted(combined_lists, key=lambda x: x[0], reverse=True)
+        midpoint = len(accuracies) // 2
+        del sorted_accs[midpoint:]
+        accuracies, self.models, self.configs, self.ids = zip(*sorted_accs)
+        return accuracies, self.models, self.configs, self.ids
+
     def run(self):
         """
         Run the Successive Halving algorithm.
@@ -92,55 +110,81 @@ class SuccessiveHalving:
         print(n)
         self.models = self.models[0:n]
         self.configs = self.configs[0:n]
+        self.ids = self.ids[0:n]
         b = self.min_resources
-        for i , model in enumerate(self.models):
-            cfg = self.configs[i]
-            for i in range(b):
+        current_epoch = b
+        accuracies = []
+
+        B = 0
+        while len(self.models) > 1:
+            B = B + len(self.models)*b
+            for i , model in enumerate(self.models):
+                cfg = self.configs[i]
                 model.to(device)
-                model_ema = None
-                model_without_ddp = model
-                n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                print('number of params:', n_parameters)
+                weights_folder = os.path.join(args.archs_dir + "/" + args.data_set)
+                weights_path = os.path.join(args.archs_dir + "/" + args.data_set, 'model_{}_epoch{}_weights.pth'.format(self.ids[i],current_epoch))
+                if not os.path.exists(weights_folder):
+                    os.makedirs(weights_folder)
+                    print(f"Folder '{weights_folder}' created.")
+                if os.path.exists(weights_path):
+                    model.load_state_dict(torch.load(weights_path))
+                for j in range(b):
 
-                linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
-                args.lr = linear_scaled_lr
-                optimizer = create_optimizer(args, model_without_ddp)
-                loss_scaler = NativeScaler()
-                lr_scheduler, _ = create_scheduler(args, optimizer)
+                    model_ema = None
+                    model_without_ddp = model
+                    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                    #print('number of params:', n_parameters)
 
-                if args.mixup > 0.:
-                    # smoothing is handled with mixup label transform
-                    criterion = SoftTargetCrossEntropy()
-                elif args.smoothing:
-                    criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-                else:
-                    criterion = torch.nn.CrossEntropyLoss()
-                if args.mode == 'retrain' and "RETRAIN" in cfg:
-                    retrain_config = None
-                    retrain_config = {'layer_num': cfg['RETRAIN']['DEPTH'],
-                                      'embed_dim': [cfg['RETRAIN']['EMBED_DIM']] * cfg['RETRAIN']['DEPTH'],
-                                      'num_heads': cfg['RETRAIN']['NUM_HEADS'],
-                                      'mlp_ratio': cfg['RETRAIN']['MLP_RATIO']}
-                print("Start training")
-                start_time = time.time()
-                max_accuracy = 0.0
-                train_stats = train_one_epoch(
-                    model, criterion, self.data_loader_train,
-                    optimizer, device, i, self.model_type, loss_scaler,
-                    args.clip_grad, model_ema, self.mixup_fn,
-                    amp=args.amp, teacher_model=None,
-                    teach_loss=None,
-                    choices=self.choices, mode = args.mode, retrain_config=retrain_config,
-                )
-                test_stats = evaluate(self.data_loader_val, self.model_type, model, device, amp=args.amp, choices=self.choices, mode = args.mode, retrain_config=retrain_config)
-                print(f"Accuracy of the network on the {len(self.dataset_val)} test images: {test_stats['acc1']:.1f}%")
-                max_accuracy = max(max_accuracy, test_stats["acc1"])
-                print(f'Max accuracy: {max_accuracy:.2f}%')
+                    linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
+                    args.lr = linear_scaled_lr
+                    optimizer = create_optimizer(args, model_without_ddp)
+                    loss_scaler = NativeScaler()
+                    lr_scheduler, _ = create_scheduler(args, optimizer)
 
-                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                             **{f'test_{k}': v for k, v in test_stats.items()},
-                             'epoch': i,
-                             'n_parameters': n_parameters}
+                    if args.mixup > 0.:
+                        # smoothing is handled with mixup label transform
+                        criterion = SoftTargetCrossEntropy()
+                    elif args.smoothing:
+                        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+                    else:
+                        criterion = torch.nn.CrossEntropyLoss()
+                    if args.mode == 'retrain' and "RETRAIN" in cfg:
+                        retrain_config = None
+                        retrain_config = {'layer_num': cfg['RETRAIN']['DEPTH'],
+                                          'embed_dim': [cfg['RETRAIN']['EMBED_DIM']] * cfg['RETRAIN']['DEPTH'],
+                                          'num_heads': cfg['RETRAIN']['NUM_HEADS'],
+                                          'mlp_ratio': cfg['RETRAIN']['MLP_RATIO']}
+                    print("Start training")
+                    start_time = time.time()
+                    max_accuracy = 0.0
+                    #max_accuracy = random.uniform(0.6, 1.0)
+                    train_stats = train_one_epoch(
+                        model, criterion, self.data_loader_train,
+                        optimizer, device, j, self.model_type, loss_scaler,
+                        args.clip_grad, model_ema, self.mixup_fn,
+                        amp=args.amp, teacher_model=None,
+                        teach_loss=None,
+                        choices=self.choices, mode = args.mode, retrain_config=retrain_config,
+                    )
+                    test_stats = evaluate(self.data_loader_val, self.model_type, model, device, amp=args.amp, choices=self.choices, mode = args.mode, retrain_config=retrain_config)
+                    print(f"Accuracy of the network on the {len(self.dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                    max_accuracy = max(max_accuracy, test_stats["acc1"])
+                    print(f'Max accuracy: {max_accuracy:.2f}%')
+    
+                    '''log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                                 **{f'test_{k}': v for k, v in test_stats.items()},
+                                 'epoch': i,
+                                 'n_parameters': n_parameters}'''
+                accuracies.append(max_accuracy)
+                print(accuracies)
+                torch.save(model.state_dict(), weights_path)
+
+            if len(accuracies) > 1:
+                accuracies, self.models, self.configs, self.ids = self.select_top_k_configs(accuracies)
+                accuracies = []
+                b = 2 * b
+                current_epoch = current_epoch + b
+        print(B)
 
 
 def get_args_parser():
