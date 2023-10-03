@@ -40,14 +40,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+    print_freq = 100
     if mode == 'retrain' and model_type == 'AUTOFORMER':
         config = retrain_config
         model_module = unwrap_model(model)
-        print(config)
+        #print(config)
         model_module.set_sample_config(config=config)
-        print(model_module.get_sampled_params_numel(config))
-        print("FLOPS is {}".format(count_flops(model_module)))
+        #print(model_module.get_sampled_params_numel(config))
+        #print("FLOPS is {}".format(count_flops(model_module)))
 
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
@@ -111,7 +111,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
+    #print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
