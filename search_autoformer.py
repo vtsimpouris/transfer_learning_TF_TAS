@@ -236,8 +236,8 @@ class Searcher(object):
         zipped_data = list(zip(self.candidates, dss))
         sorted_data = sorted(zipped_data, key=lambda x: x[1], reverse=True)
         sorted_items = [item[0] for item in sorted_data]
-        top10 = math.ceil((self.population_num*10)/100)
-        for i in range(top10):
+        top1 = math.ceil((self.population_num)/100)
+        for i in range(top1):
             self.save_cand_arch(sorted_items[i],i)
 
         print('Searched Architecture: ', self.top['cand'])

@@ -40,7 +40,10 @@ def parse_yaml_file(file_path):
     with open(file_path, 'r') as file:
         yaml_data = yaml.load(file, Loader=yaml.FullLoader)
     return yaml_data
-
+def save_list_to_file(file_path, data_list):
+    with open(file_path, 'w') as file:
+        for item in data_list:
+            file.write(str(item) + '\n')
 def load_configs(file_path, max_cfgs):
     folder_path = file_path
     yaml_files = find_yaml_files(folder_path)
@@ -55,7 +58,7 @@ def load_configs(file_path, max_cfgs):
     return cfgs
 
 class SuccessiveHalving:
-    def __init__(self, configs, models, resource_budget,data_loader_train,model_type,mixup_fn,choices,data_loader_val,dataset_val, min_resources = 1):
+    def __init__(self, configs, models, resource_budget,data_loader_train,model_type,mixup_fn,choices,closest_dataset,data_loader_val,dataset_val, min_resources = 3):
         """
         Initialize the Successive Halving algorithm.
 
@@ -75,6 +78,7 @@ class SuccessiveHalving:
         self.data_loader_val = data_loader_val
         self.dataset_val = dataset_val
         self.ids = list(range(0,len(self.models)))
+        self.closest_dataset = closest_dataset
 
 
     def max_models(self,B,e):
@@ -114,26 +118,31 @@ class SuccessiveHalving:
         b = self.min_resources
         current_epoch = b
         accuracies = []
-
+        accs = [[] for _ in range(n)]
         B = 0
         while len(self.models) > 1:
+            print(current_epoch)
             B = B + len(self.models)*b
+
             for i , model in enumerate(self.models):
                 cfg = self.configs[i]
                 model.to(device)
                 weights_folder = os.path.join(args.archs_dir + "/" + args.data_set)
-                weights_path = os.path.join(args.archs_dir + "/" + args.data_set, 'model_{}_epoch{}_weights.pth'.format(self.ids[i],current_epoch))
+                weights_path = os.path.join(args.archs_dir + "/" + self.closest_dataset, 'model_{}_epoch{}_weights.pth'.format(self.ids[i],current_epoch))
                 if not os.path.exists(weights_folder):
                     os.makedirs(weights_folder)
                     print(f"Folder '{weights_folder}' created.")
                 if os.path.exists(weights_path):
-                    model.load_state_dict(torch.load(weights_path))
+                    pretrained_dict = torch.load(weights_path)
+                    pretrained_dict = {k: v for k, v in pretrained_dict.items() if 'head' not in k}
+                    model.load_state_dict(pretrained_dict,strict=False)
+
                 for j in range(b):
 
                     model_ema = None
                     model_without_ddp = model
                     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                    #print('number of params:', n_parameters)
+                    print('number of params:', n_parameters)
 
                     linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
                     args.lr = linear_scaled_lr
@@ -158,6 +167,8 @@ class SuccessiveHalving:
                     start_time = time.time()
                     max_accuracy = 0.0
                     #max_accuracy = random.uniform(0.6, 1.0)
+                    #accuracy = random.uniform(0.6, 1.0)
+
                     train_stats = train_one_epoch(
                         model, criterion, self.data_loader_train,
                         optimizer, device, j, self.model_type, loss_scaler,
@@ -168,6 +179,7 @@ class SuccessiveHalving:
                     )
                     test_stats = evaluate(self.data_loader_val, self.model_type, model, device, amp=args.amp, choices=self.choices, mode = args.mode, retrain_config=retrain_config)
                     print(f"Accuracy of the network on the {len(self.dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                    accs[i].append(test_stats["acc1"])
                     max_accuracy = max(max_accuracy, test_stats["acc1"])
                     print(f'Max accuracy: {max_accuracy:.2f}%')
     
@@ -175,21 +187,27 @@ class SuccessiveHalving:
                                  **{f'test_{k}': v for k, v in test_stats.items()},
                                  'epoch': i,
                                  'n_parameters': n_parameters}'''
-                accuracies.append(max_accuracy)
+                accuracies.append(test_stats["acc1"])
+                weights_path = os.path.join(args.archs_dir + "/" + args.data_set,
+                                            'model_{}_epoch{}_weights.pth'.format(self.ids[i], current_epoch))
                 torch.save(model.state_dict(), weights_path)
 
             if len(accuracies) > 1:
+                #print(accuracies)
                 accuracies, self.models, self.configs, self.ids = self.select_top_k_configs(accuracies)
                 accuracies = []
                 b = 2 * b
                 current_epoch = current_epoch + b
+
         if(len(self.models) == 1):
             weights_path = os.path.join(args.archs_dir + "/" + args.data_set,
                                         'model_{}_epoch{}_weights.pth'.format(self.ids[0], current_epoch - b))
+            acc_path = os.path.join(args.archs_dir + "/" + args.data_set,
+                                    'accuracies_SH.txt')
+            save_list_to_file(acc_path, accs)
+            #print(accs)
             print(weights_path)
-            print(self.ids[0])
             return weights_path,self.ids[0]
-        print(B)
 
 
 def get_args_parser():
@@ -449,10 +467,12 @@ def main(args):
 
             choices = {'num_heads': cfg['SEARCH_SPACE']['NUM_HEADS'], 'mlp_ratio': cfg['SEARCH_SPACE']['MLP_RATIO'],
                        'embed_dim': cfg['SEARCH_SPACE']['EMBED_DIM'], 'depth': cfg['SEARCH_SPACE']['DEPTH']}
-    sh = SuccessiveHalving(cfgs, models, resource_budget=10, data_loader_train=data_loader_train, model_type=model_type, mixup_fn=mixup_fn, choices=choices, data_loader_val=data_loader_val, dataset_val=dataset_val)
+    closest_dataset = "CIFAR100"
+    sh = SuccessiveHalving(cfgs, models, resource_budget=50, data_loader_train=data_loader_train, model_type=model_type, mixup_fn=mixup_fn, choices=choices, closest_dataset = closest_dataset, data_loader_val=data_loader_val, dataset_val=dataset_val)
     weights_path, best_model_id = sh.run()
     model = models[best_model_id]
     cfg = cfgs[best_model_id]
+    sys.exit(1)
 
 
     if args.model_type == 'AUTOFORMER':
@@ -579,7 +599,7 @@ def main(args):
             teach_loss=teacher_loss,
             choices=choices, mode = args.mode, retrain_config=retrain_config,
         )
-        weights_path = os.path.join(args.archs_dir, 'best_model_epochs{}_weights.pth'.format(epoch))
+        weights_path = os.path.join(args.archs_dir + "/" + args.data_set, 'best_model_{}_weights.pth'.format(best_model_id))
         torch.save(model.state_dict(), weights_path)
 
         lr_scheduler.step(epoch)

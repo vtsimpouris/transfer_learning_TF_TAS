@@ -135,7 +135,7 @@ def evaluate(data_loader, model_type, model, device, amp=True, choices=None, mod
         config = retrain_config
 
     if model_type == 'AUTOFORMER':
-        print("sampled model config: {}".format(config))
+        #print("sampled model config: {}".format(config))
         parameters = model_module.get_sampled_params_numel(config)
         print("sampled model parameters: {}".format(parameters))
 
@@ -159,7 +159,7 @@ def evaluate(data_loader, model_type, model, device, amp=True, choices=None, mod
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+    #print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
+    #          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
