@@ -118,10 +118,10 @@ class SuccessiveHalving:
         b = self.min_resources
         current_epoch = b
         accuracies = []
-        accs = [[] for _ in range(n)]
+        verbose_accuracies = [[] for _ in range(n)]
         B = 0
         while len(self.models) > 1:
-            print(current_epoch)
+            #print(current_epoch)
             B = B + len(self.models)*b
 
             for i , model in enumerate(self.models):
@@ -142,7 +142,7 @@ class SuccessiveHalving:
                     model_ema = None
                     model_without_ddp = model
                     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                    print('number of params:', n_parameters)
+                    #print('number of params:', n_parameters)
 
                     linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
                     args.lr = linear_scaled_lr
@@ -166,34 +166,34 @@ class SuccessiveHalving:
                     #print("Start training")
                     start_time = time.time()
                     max_accuracy = 0.0
-                    #max_accuracy = random.uniform(0.6, 1.0)
-                    #accuracy = random.uniform(0.6, 1.0)
+                    max_accuracy = random.uniform(0.6, 1.0)
+                    accuracy = random.uniform(0.6, 1.0)
 
-                    train_stats = train_one_epoch(
+                    '''train_stats = train_one_epoch(
                         model, criterion, self.data_loader_train,
                         optimizer, device, j, self.model_type, loss_scaler,
                         args.clip_grad, model_ema, self.mixup_fn,
                         amp=args.amp, teacher_model=None,
                         teach_loss=None,
                         choices=self.choices, mode = args.mode, retrain_config=retrain_config,
-                    )
-                    test_stats = evaluate(self.data_loader_val, self.model_type, model, device, amp=args.amp, choices=self.choices, mode = args.mode, retrain_config=retrain_config)
-                    print(f"Accuracy of the network on the {len(self.dataset_val)} test images: {test_stats['acc1']:.1f}%")
-                    accs[i].append(test_stats["acc1"])
-                    max_accuracy = max(max_accuracy, test_stats["acc1"])
-                    print(f'Max accuracy: {max_accuracy:.2f}%')
+                    )'''
+                    #test_stats = evaluate(self.data_loader_val, self.model_type, model, device, amp=args.amp, choices=self.choices, mode = args.mode, retrain_config=retrain_config)
+                    #print(f"Accuracy of the network on the {len(self.dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                    #accuracy = test_stats["acc1"]
+                    verbose_accuracies[self.ids[i]].append(accuracy)
+                    max_accuracy = max(max_accuracy, accuracy)
+                    #print(f'Max accuracy: {max_accuracy:.2f}%')
     
                     '''log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                                  **{f'test_{k}': v for k, v in test_stats.items()},
                                  'epoch': i,
                                  'n_parameters': n_parameters}'''
-                accuracies.append(test_stats["acc1"])
+                accuracies.append(accuracy)
                 weights_path = os.path.join(args.archs_dir + "/" + args.data_set,
                                             'model_{}_epoch{}_weights.pth'.format(self.ids[i], current_epoch))
                 torch.save(model.state_dict(), weights_path)
 
             if len(accuracies) > 1:
-                #print(accuracies)
                 accuracies, self.models, self.configs, self.ids = self.select_top_k_configs(accuracies)
                 accuracies = []
                 b = 2 * b
@@ -203,8 +203,8 @@ class SuccessiveHalving:
             weights_path = os.path.join(args.archs_dir + "/" + args.data_set,
                                         'model_{}_epoch{}_weights.pth'.format(self.ids[0], current_epoch - b))
             acc_path = os.path.join(args.archs_dir + "/" + args.data_set,
-                                    'accuracies_SH.txt')
-            save_list_to_file(acc_path, accs)
+                                    'accuracies_SH_test.txt')
+            save_list_to_file(acc_path, verbose_accuracies)
             #print(accs)
             print(weights_path)
             return weights_path,self.ids[0]
