@@ -23,7 +23,8 @@ from timm.utils.model import unwrap_model
 import copy
 from timm.utils import accuracy
 import matplotlib.pyplot as plt
-
+from torchprofile import profile_macs
+from lib.flops import count_flops
 
 def decode_cand_tuple(cand_tuple):
     depth = cand_tuple[0]
@@ -87,7 +88,7 @@ class Searcher(object):
         self.all_res = []
 
     def save_cand_arch(self,cand,i):
-        file_path = os.path.join(args.output_dir, 'data_{}.yaml'.format(i))
+        file_path = os.path.join(args.output_dir, 'config_{}.yaml'.format(i))
         new_dict = {}
         new_dict['SUPERNET'] = {'MLP_RATIO': 4}
         new_dict['SUPERNET']['NUM_HEADS'] = 4
@@ -170,6 +171,13 @@ class Searcher(object):
                                             self.train_loader,
                                             ('random', 1, 1000),
                                             self.device)
+
+        model_module = unwrap_model(self.model_without_ddp)
+        # Set the model to evaluation mode
+        model_module.eval()
+        print("FLOPS is {}".format(count_flops(model_module)))
+        info['FLOPS'] = count_flops(model_module)
+
         if self.top == {}:
             self.top['cand']=cand
             self.top[self.indicator_name]=indicators[self.indicator_name]
@@ -218,14 +226,15 @@ class Searcher(object):
 
     def search(self):
         self.get_random(self.population_num)
-
-        dss = []
+        flops = []
         for i in range(len(self.candidates)):
-            dss.append(self.all_res[i]['indicator']['dss'])
+            #dss.append(self.all_res[i]['indicator']['dss'])
+            flops.append(self.vis_dict[i]['FLOPS'])
+            print(flops[i])
 
         plot = True
         if(plot):
-            plt.hist(dss, bins=10, color='blue', edgecolor='black')
+            plt.hist(flops, bins=10, color='blue', edgecolor='black')
             # Customize the plot (optional)
             plt.title('architectures DSS distribution')
             plt.xlabel('DSS')
@@ -233,12 +242,15 @@ class Searcher(object):
             # Show the plot
             plt.show()
 
-        zipped_data = list(zip(self.candidates, dss))
-        sorted_data = sorted(zipped_data, key=lambda x: x[1], reverse=True)
-        sorted_items = [item[0] for item in sorted_data]
-        top1 = math.ceil((self.population_num)/100)
-        for i in range(top1):
-            self.save_cand_arch(sorted_items[i],i)
+        zipped_data = list(zip(self.candidates, flops))
+
+        # Sample architectures uniformly based on flops
+        sampled_data = random.sample(zipped_data, 10)
+
+        sorted_items = [item[0] for item in sampled_data]
+
+        for i, architecture in enumerate(sorted_items):
+            self.save_cand_arch(architecture, i)
 
         print('Searched Architecture: ', self.top['cand'])
 
