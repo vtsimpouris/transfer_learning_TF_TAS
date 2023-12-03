@@ -227,17 +227,15 @@ class Searcher(object):
     def search(self):
         self.get_random(self.population_num)
         flops = []
-        for i in range(len(self.candidates)):
-            #dss.append(self.all_res[i]['indicator']['dss'])
+        for i in range(len(self.vis_dict)):
             flops.append(self.vis_dict[i]['FLOPS'])
-            print(flops[i])
 
         plot = True
         if(plot):
             plt.hist(flops, bins=10, color='blue', edgecolor='black')
             # Customize the plot (optional)
-            plt.title('architectures DSS distribution')
-            plt.xlabel('DSS')
+            plt.title('architectures FLOPs distribution')
+            plt.xlabel('FLOPs')
             plt.ylabel('Frequency')
             # Show the plot
             plt.show()
