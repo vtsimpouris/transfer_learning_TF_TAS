@@ -1,0 +1,3 @@
+#!/bin/bash
+python transfer_learning_cifar100_base.py --data-path './dataset/CIFAR100' --data-set 'CIFAR100' --gp --change_qk --relative_position --mode retrain --model_type 'AUTOFORMER' --dist-eval --cfg 'OUTPUT/search/data_0.yaml' --archs_dir 'OUTPUT/search' --output_dir './OUTPUT/sample' --epochs 50
+python transfer_learning_cifar100.py --data-path './dataset/CIFAR100' --data-set 'CIFAR100' --gp --change_qk --relative_position --mode retrain --model_type 'AUTOFORMER' --dist-eval --cfg 'OUTPUT/search/data_0.yaml' --archs_dir 'OUTPUT/search' --output_dir './OUTPUT/sample' --epochs 25
