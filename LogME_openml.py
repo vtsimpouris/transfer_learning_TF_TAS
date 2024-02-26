@@ -18,7 +18,7 @@ from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler
 from lib.datasets import build_dataset
-from model.space_engine import train_one_epoch, evaluate
+from model.space_engine import train_one_epoch, evaluate, extract_features
 from lib.samplers import RASampler
 from lib import utils
 from lib.config import cfg, update_config_from_file
@@ -35,6 +35,7 @@ from sklearn.preprocessing import LabelEncoder
 from PIL import Image
 import scipy.optimize as opt
 import random
+from LogME import LogME
 
 def find_yaml_files(folder_path):
     yaml_files = []
@@ -384,31 +385,6 @@ def main(args):
         drop_last=False
     )
 
-    if args.distributed:
-        num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()
-        if args.repeated_aug:
-            sampler_train = RASampler(
-                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-            )
-        else:
-            sampler_train = torch.utils.data.DistributedSampler(
-                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-            )
-        if args.dist_eval:
-            if len(dataset_val) % num_tasks != 0:
-                print(
-                    'Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                    'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                    'equal num of samples per-process.')
-            sampler_val = torch.utils.data.DistributedSampler(
-                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-        else:
-            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    else:
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -440,28 +416,16 @@ def main(args):
 
             choices = {'num_heads': cfg['SEARCH_SPACE']['NUM_HEADS'], 'mlp_ratio': cfg['SEARCH_SPACE']['MLP_RATIO'],
                        'embed_dim': cfg['SEARCH_SPACE']['EMBED_DIM'], 'depth': cfg['SEARCH_SPACE']['DEPTH']}
-        elif args.model_type == 'PIT':
-            model_type = args.model_type
-            retrain_config = None
-            retrain_config = {'layer_num': cfg.RETRAIN.DEPTH, 'base_dim': cfg.RETRAIN.BASE_DIM,
-                              'num_heads': cfg.RETRAIN.NUM_HEADS, 'mlp_ratio': cfg.RETRAIN.MLP_RATIO, 'patch_size': cfg.RETRAIN.PATCH_SIZE}
-            model = pit(retrain_config, pretrain = False)
-            choices = {'num_heads': cfg.SEARCH_SPACE.NUM_HEADS, 'mlp_ratio': cfg.SEARCH_SPACE.MLP_RATIO,
-                       'base_dim': cfg.SEARCH_SPACE.BASE_DIM, 'depth': cfg.SEARCH_SPACE.DEPTH,
-                       'patch_size': cfg.SEARCH_SPACE.PATCH_SIZE}
+
+            weights_path = "OUTPUT/search/Meta_Album_APL_Extended/model_0_weights.pth"
+            state_dict = torch.load(weights_path)
+            state_dict.pop('head.weight', None)
+            state_dict.pop('head.bias', None)
+            #model.load_state_dict(state_dict, strict=False)
 
         model.to(device)
-        if args.teacher_model:
-            teacher_model = create_model(
-                args.teacher_model,
-                pretrained=True,
-                num_classes=args.nb_classes,
-            )
-            teacher_model.to(device)
-            teacher_loss = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-        else:
-            teacher_model = None
-            teacher_loss = None
+        teacher_model = None
+        teacher_loss = None
 
         model_ema = None
 
@@ -505,21 +469,7 @@ def main(args):
                 name = ','.join(k.split('.')[start_idx:])
                 new_state_dict[name] = v
             return new_state_dict
-        if args.resume:
-            if args.resume.startswith('https'):
-                checkpoint = torch.hub.load_state_dict_from_url(
-                    args.resume, map_location='cpu', check_hash=True)
-            else:
-                checkpoint = torch.load(args.resume, map_location='cpu')
-            model_without_ddp.load_state_dict(checkpoint['model'])
-            if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer'])
-                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-                args.start_epoch = checkpoint['epoch'] + 1
-                if 'scaler' in checkpoint:
-                    loss_scaler.load_state_dict(checkpoint['scaler'])
-                if args.model_ema:
-                    utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
+
         if args.mode == 'retrain' and "RETRAIN" in cfg and model_type == 'AUTOFORMER':
             retrain_config = None
             retrain_config = {'layer_num': cfg['RETRAIN']['DEPTH'], 'embed_dim': [cfg['RETRAIN']['EMBED_DIM']]*cfg['RETRAIN']['DEPTH'],
@@ -539,14 +489,14 @@ def main(args):
             if args.distributed:
                 data_loader_train.sampler.set_epoch(epoch)
 
-            train_stats = train_one_epoch(
+            '''train_stats = train_one_epoch(
                 model, criterion, data_loader_train,
                 optimizer, device, epoch, model_type, loss_scaler,
                 args.clip_grad, model_ema, mixup_fn,
                 amp=args.amp, teacher_model=teacher_model,
                 teach_loss=teacher_loss,
                 choices=choices, mode = args.mode, retrain_config=retrain_config,
-            )
+            )'''
 
 
             lr_scheduler.step(epoch)
@@ -563,38 +513,26 @@ def main(args):
                         'args': args,
                     }, checkpoint_path)
 
-            test_stats = evaluate(data_loader_val, model_type, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config)
-            print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+            #test_stats = evaluate(data_loader_val, model_type, model, device, amp=args.amp, choices=choices, mode = args.mode, retrain_config=retrain_config)
+            features,targets = extract_features(data_loader_val, model_type, model, device, amp=args.amp, choices=choices,
+                                  mode=args.mode, retrain_config=retrain_config)
+            print(f"Features size {np.shape(features)}")
+            print(f"Target size {np.shape(targets)}")
+            logme = LogME(regression=False)
+            # f has shape of [N, D], y has shape [N]
+            score = logme.fit(features, targets)
+            print(f"LogME score {score}")
 
+            #print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
-            if (test_stats["acc1"] > max_accuracy):
-                weights_folder = args.archs_dir + "/" + args.data_set
-                if not os.path.exists(weights_folder):
-                    os.makedirs(weights_folder)
-                    print(f"Folder '{weights_folder}' created.")
-                weights_path = os.path.join(args.archs_dir + "/" + args.data_set,
-                                            'model_{}_weights.pth'.format(model_id))
-                torch.save(model.state_dict(), weights_path)
-            max_accuracy = max(max_accuracy, test_stats["acc1"])
-            print(f'Max accuracy: {max_accuracy:.2f}%')
-
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+            '''log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          **{f'test_{k}': v for k, v in test_stats.items()},
                          'epoch': epoch,
-                         'n_parameters': n_parameters}
+                         'n_parameters': n_parameters}'''
 
-            if args.output_dir and utils.is_main_process():
+            '''if args.output_dir and utils.is_main_process():
                 with (output_dir / "log.txt").open("a") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-            accuracy = test_stats["acc1"]
-            acc_path = os.path.join(args.archs_dir + "/" + args.data_set,
-                                            'model_{}_accuracies.txt').format(model_id)
-            # Load the existing list from the file
-            accuracies = load_list_from_file(acc_path)
-            accuracies.append(accuracy)
-
-            # Save the extended list back to the file
-            save_list_to_file(acc_path, accuracies)
+                    f.write(json.dumps(log_stats) + "\n")'''
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))

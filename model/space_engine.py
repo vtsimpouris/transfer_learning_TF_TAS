@@ -12,6 +12,8 @@ import time
 from lib.flops import count_flops
 from thop import profile
 import numpy as np
+from torch.autograd import Function
+
 
 def sample_configs(choices):
 
@@ -165,3 +167,53 @@ def evaluate(data_loader, model_type, model, device, amp=True, choices=None, mod
     #          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+# Define a hook to capture features
+
+# Update your extract_features function
+@torch.no_grad()
+def extract_features(data_loader, model_type, model, device, amp=True, choices=None, mode='super', retrain_config=None):
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+    # switch to evaluation mode
+    model.eval()
+    if mode == 'super' and model_type == 'AUTOFORMER':
+        config = sample_configs(choices=choices)
+        model_module = unwrap_model(model)
+        model_module.set_sample_config(config=config)
+    elif model_type == 'AUTOFORMER':
+        config = retrain_config
+        model_module = unwrap_model(model)
+        model_module.set_sample_config(config=config)
+    else:
+        config = retrain_config
+
+    if model_type == 'AUTOFORMER':
+        parameters = model_module.get_sampled_params_numel(config)
+        print("sampled model parameters: {}".format(parameters))
+
+    # Initialize the captured features list
+    captured_features = []
+    targets = []
+
+    for images, target in metric_logger.log_every(data_loader, 10, header):
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        # compute output
+        if amp:
+            with torch.cuda.amp.autocast():
+                output = model(images)
+        else:
+            output = model(images)
+
+        # Append the output tensor to the list
+        targets.append(target.cpu().detach().numpy())
+        captured_features.append(output.cpu().detach().numpy())
+
+    # Convert the list of captured features to a single numpy array
+    captured_features = np.concatenate(captured_features, axis=0) if captured_features else None
+    targets = np.concatenate(targets, axis=0) if targets else None
+
+    return captured_features,targets
